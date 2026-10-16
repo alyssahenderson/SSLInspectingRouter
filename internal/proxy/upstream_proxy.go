@@ -34,6 +34,8 @@ func newUpstreamTransport(tlsConfig *tls.Config) *http.Transport {
 	tr.TLSHandshakeTimeout = 10 * time.Second
 	if tlsConfig != nil {
 		tr.TLSClientConfig = tlsConfig
+		tr.ForceAttemptHTTP2 = false
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 	}
 	return tr
 }
