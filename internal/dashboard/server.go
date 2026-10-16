@@ -15,6 +15,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -66,6 +67,14 @@ type Server struct {
 	now                func() time.Time
 	lastRequestCount   atomic.Int64
 	lastActiveSession  atomic.Int64
+
+	statusCacheMu      sync.Mutex
+	cachedWGStatus     wireguard.Status
+	cachedWGStatusErr  error
+	cachedWGStatusAt   time.Time
+	cachedTorStatus    tor.Status
+	cachedTorStatusErr error
+	cachedTorStatusAt  time.Time
 }
 
 type TLSOptions struct {

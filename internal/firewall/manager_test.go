@@ -315,3 +315,99 @@ func TestMatchCIDR(t *testing.T) {
 		}
 	}
 }
+
+func TestUpdateRulePriorityChangePersistsCorrectRule(t *testing.T) {
+	db := openTestDB(t)
+	m := &Manager{rules: []Rule{}, nextID: 1}
+	if err := m.Initialize(db); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+
+	r1 := m.AddRule(Rule{
+		Priority: 100,
+		Enabled:  true,
+		Action:   ActionBlock,
+		Match:    RuleMatch{Host: "high.example.com"},
+	})
+	r2 := m.AddRule(Rule{
+		Priority: 10,
+		Enabled:  true,
+		Action:   ActionInspect,
+		Match:    RuleMatch{Host: "low.example.com"},
+	})
+
+	// Lower r1's priority below r2 so sortRulesByPriority moves r1 from index 0 to index 1.
+	updated := m.UpdateRule(r1.ID, Rule{
+		Priority: 1,
+		Enabled:  true,
+		Action:   ActionBypass,
+		Match:    RuleMatch{Host: "updated.example.com"},
+	})
+	if updated == nil {
+		t.Fatal("UpdateRule returned nil")
+	}
+	if updated.ID != r1.ID || updated.Priority != 1 || updated.Action != ActionBypass || updated.Match.Host != "updated.example.com" {
+		t.Fatalf("UpdateRule returned wrong rule: %+v", *updated)
+	}
+
+	// Reload from DB to verify the right rule was persisted.
+	m2 := &Manager{rules: []Rule{}, nextID: 1}
+	if err := m2.Initialize(db); err != nil {
+		t.Fatalf("second Initialize failed: %v", err)
+	}
+	reloaded1 := m2.GetRuleByID(r1.ID)
+	reloaded2 := m2.GetRuleByID(r2.ID)
+	if reloaded1 == nil || reloaded2 == nil {
+		t.Fatalf("expected both rules after reload, got r1=%v r2=%v", reloaded1, reloaded2)
+	}
+	if reloaded1.Priority != 1 || reloaded1.Action != ActionBypass || reloaded1.Match.Host != "updated.example.com" {
+		t.Fatalf("reloaded r1 corrupted: %+v", *reloaded1)
+	}
+	if reloaded2.Priority != 10 || reloaded2.Action != ActionInspect || reloaded2.Match.Host != "low.example.com" {
+		t.Fatalf("reloaded r2 corrupted: %+v", *reloaded2)
+	}
+}
+
+func TestMatchTrafficCaseInsensitiveHostAndPrecompiledMatchers(t *testing.T) {
+	m := newTestManager(t)
+	m.SetEnabled(true)
+
+	m.AddRule(Rule{
+		Priority: 30,
+		Enabled:  true,
+		Action:   ActionBlock,
+		Match:    RuleMatch{Host: "Example.COM"},
+	})
+	m.AddRule(Rule{
+		Priority: 20,
+		Enabled:  true,
+		Action:   ActionBypass,
+		Match:    RuleMatch{CIDR: "10.10.0.0/16"},
+	})
+
+	if action, _, matched := m.MatchTraffic("sub.EXAMPLE.com", "192.168.1.5"); !matched || action != ActionBlock {
+		t.Fatalf("expected case-insensitive host match ActionBlock, got (%q, %v)", action, matched)
+	}
+
+	if action, _, matched := m.MatchTraffic("other.org", "10.10.5.9"); !matched || action != ActionBypass {
+		t.Fatalf("expected CIDR match ActionBypass, got (%q, %v)", action, matched)
+	}
+}
+
+func TestMatchTrafficRegexPreservesHostCase(t *testing.T) {
+	m := newTestManager(t)
+	m.AddRule(Rule{
+		Priority: 10,
+		Enabled:  true,
+		Action:   ActionBlock,
+		Match:    RuleMatch{HostRegex: `^API\.example\.com$`},
+	})
+	m.SetEnabled(true)
+
+	if action, _, matched := m.MatchTraffic("API.example.com", "192.168.1.5"); !matched || action != ActionBlock {
+		t.Fatalf("expected case-sensitive regex match, got (%q, %v)", action, matched)
+	}
+	if _, _, matched := m.MatchTraffic("api.example.com", "192.168.1.5"); matched {
+		t.Fatal("lowercase hostname unexpectedly matched case-sensitive regex")
+	}
+}

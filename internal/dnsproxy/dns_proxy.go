@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	DNS_PROXY_PORT = 5353
-	dnsTimeout     = 2 * time.Second
+	DNS_PROXY_PORT   = 5353
+	dnsTimeout       = 2 * time.Second
+	maxConcurrentUDP = 64
 )
 
 type DNSProxy struct {
@@ -75,10 +76,14 @@ func (p *DNSProxy) Start() error {
 func (p *DNSProxy) serveUDP(conn net.PacketConn) {
 	defer conn.Close()
 	buf := make([]byte, 4096)
+	sem := make(chan struct{}, maxConcurrentUDP)
 
 	for {
 		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			logger.LogError(fmt.Sprintf("DNS UDP read error: %v", err))
 			continue
 		}
@@ -86,32 +91,40 @@ func (p *DNSProxy) serveUDP(conn net.PacketConn) {
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
 
-		blocked, qname, qtype := p.analyzeQuery(payload)
-		sourceIP, _, _ := net.SplitHostPort(addr.String())
-		var reqID int64
-		if qname != "" {
-			reqID = logger.LogDNSRequest(sourceIP, qname, qtype)
-		}
-		if blocked {
-			logger.LogInfo(fmt.Sprintf("Dropped DNS UDP query for %s from %s", qname, addr.String()))
-			if qname != "" {
-				logger.LogDNSResponse(reqID, sourceIP, qname, "DNS DROPPED", "Blocked by policy")
-			}
-			continue
-		}
+		sem <- struct{}{}
+		go func(payload []byte, addr net.Addr) {
+			defer func() { <-sem }()
+			p.handleUDP(conn, payload, addr)
+		}(payload, addr)
+	}
+}
 
-		resp, err := p.forwardUDP(payload)
-		if err != nil {
-			logger.LogError(fmt.Sprintf("DNS UDP forward error: %v", err))
-			continue
-		}
+func (p *DNSProxy) handleUDP(conn net.PacketConn, payload []byte, addr net.Addr) {
+	blocked, qname, qtype := p.analyzeQuery(payload)
+	sourceIP, _, _ := net.SplitHostPort(addr.String())
+	var reqID int64
+	if qname != "" {
+		reqID = logger.LogDNSRequest(sourceIP, qname, qtype)
+	}
+	if blocked {
+		logger.LogInfo(fmt.Sprintf("Dropped DNS UDP query for %s from %s", qname, addr.String()))
 		if qname != "" {
-			logger.LogDNSResponse(reqID, sourceIP, qname, "DNS RESPONSE", fmt.Sprintf("Bytes: %d", len(resp)))
+			logger.LogDNSResponse(reqID, sourceIP, qname, "DNS DROPPED", "Blocked by policy")
 		}
+		return
+	}
 
-		if _, err := conn.WriteTo(resp, addr); err != nil {
-			logger.LogError(fmt.Sprintf("DNS UDP write error: %v", err))
-		}
+	resp, err := p.forwardUDP(payload)
+	if err != nil {
+		logger.LogError(fmt.Sprintf("DNS UDP forward error: %v", err))
+		return
+	}
+	if qname != "" {
+		logger.LogDNSResponse(reqID, sourceIP, qname, "DNS RESPONSE", fmt.Sprintf("Bytes: %d", len(resp)))
+	}
+
+	if _, err := conn.WriteTo(resp, addr); err != nil {
+		logger.LogError(fmt.Sprintf("DNS UDP write error: %v", err))
 	}
 }
 

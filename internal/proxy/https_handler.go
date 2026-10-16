@@ -51,20 +51,24 @@ const (
 	tunnelLogSNIOnly
 )
 
+const (
+	tlsHandshakeTimeout      = 10 * time.Second
+	httpsFirstRequestTimeout = 15 * time.Second
+	httpsIdleRequestTimeout  = 60 * time.Second
+	tunnelIdleTimeout        = 2 * time.Minute
+	maxClientHelloRecordLen  = 16 * 1024
+)
+
 // NewHTTPSHandler creates a new HTTPS handler with a custom client that ignores upstream certificates (for testing).
 func NewHTTPSHandler(certManager *cert.CertManager, blockList *blocklist.BlockList, bypassList *blocklist.BlockList, rewriter *rewrites.Engine) *HTTPSHandler {
-	baseTransport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: false, // Verify upstream certificates by default.
-		},
-	}
-	ipTransport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			// IP-based transparent targets commonly present hostname certs.
-			// Skip upstream cert verification for IP endpoints to avoid false 502 errors.
-			InsecureSkipVerify: true,
-		},
-	}
+	baseTransport := newUpstreamTransport(&tls.Config{
+		InsecureSkipVerify: false, // Verify upstream certificates by default.
+	})
+	ipTransport := newUpstreamTransport(&tls.Config{
+		// IP-based transparent targets commonly present hostname certs.
+		// Skip upstream cert verification for IP endpoints to avoid false 502 errors.
+		InsecureSkipVerify: true,
+	})
 
 	h := &HTTPSHandler{
 		certManager: certManager,
@@ -381,13 +385,17 @@ func (h *HTTPSHandler) HandleConnection(conn net.Conn) {
 		return
 	}
 
+	tlsCert := certPair.TLSCert
+	if len(tlsCert.Certificate) == 0 {
+		tlsCert = tls.Certificate{
+			Certificate: [][]byte{certPair.Cert.Raw, h.certManager.GetCACert().Raw},
+			PrivateKey:  certPair.Key,
+			Leaf:        certPair.Cert,
+		}
+	}
+
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{
-			{
-				Certificate: [][]byte{certPair.Cert.Raw, h.certManager.GetCACert().Raw},
-				PrivateKey:  certPair.Key,
-			},
-		},
+		Certificates: []tls.Certificate{tlsCert},
 	}
 
 	// Wrap the connection to replay the bytes we read for SNI sniffing
@@ -397,10 +405,12 @@ func (h *HTTPSHandler) HandleConnection(conn net.Conn) {
 	}
 
 	tlsConn := tls.Server(rConn, tlsConfig)
+	_ = conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
 	if err := tlsConn.Handshake(); err != nil {
 		logger.LogError(fmt.Sprintf("TLS handshake failed: %v", err))
 		return
 	}
+	_ = conn.SetDeadline(time.Time{})
 	defer tlsConn.Close()
 
 	h.handleHTTPSRequest(tlsConn, hostname, sourceIP, upstreamPort)
@@ -423,16 +433,26 @@ func (h *HTTPSHandler) handleBypassedTLS(clientConn net.Conn, hostname, sourceIP
 	}
 	defer upstreamConn.Close()
 
+	_ = upstreamConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := io.Copy(upstreamConn, bytes.NewReader(peekedBytes)); err != nil {
 		logger.LogError(fmt.Sprintf("Bypass upstream write failed for %s: %v", hostname, err))
 		logTunnelResponse(reqID, sourceIP, hostname, logMode)
 		return
 	}
+	_ = upstreamConn.SetWriteDeadline(time.Time{})
+
+	activity := &tunnelActivity{
+		conns:   []net.Conn{clientConn, upstreamConn},
+		timeout: tunnelIdleTimeout,
+	}
+	activity.refresh()
+	clientIdle := &idleTimeoutConn{Conn: clientConn, activity: activity}
+	upstreamIdle := &idleTimeoutConn{Conn: upstreamConn, activity: activity}
 
 	errCh := make(chan error, 2)
 
 	go func() {
-		_, err := io.Copy(upstreamConn, clientConn)
+		_, err := io.Copy(upstreamIdle, clientIdle)
 		if tcpConn, ok := upstreamConn.(*net.TCPConn); ok {
 			_ = tcpConn.CloseWrite()
 		}
@@ -440,7 +460,7 @@ func (h *HTTPSHandler) handleBypassedTLS(clientConn net.Conn, hostname, sourceIP
 	}()
 
 	go func() {
-		_, err := io.Copy(clientConn, upstreamConn)
+		_, err := io.Copy(clientIdle, upstreamIdle)
 		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
 			_ = tcpConn.CloseWrite()
 		}
@@ -476,19 +496,36 @@ func logTunnelResponse(reqID int64, sourceIP, hostname string, logMode tunnelLog
 	}
 }
 
-// handleHTTPSRequest reads the decrypted request from the TLS connection and forwards it.
+// handleHTTPSRequest reads decrypted HTTP/1.1 requests from the TLS connection and forwards them.
 func (h *HTTPSHandler) handleHTTPSRequest(tlsConn *tls.Conn, hostname, sourceIP string, upstreamPort int) {
-	req, err := http.ReadRequest(bufioReaderFromConn(tlsConn))
-	if err != nil {
-		logger.LogError(fmt.Sprintf("Failed to read HTTPS request: %v", err))
-		return
+	reader := bufioReaderFromConn(tlsConn)
+	for reqIndex := 0; ; reqIndex++ {
+		readTimeout := httpsIdleRequestTimeout
+		if reqIndex == 0 {
+			readTimeout = httpsFirstRequestTimeout
+		}
+		_ = tlsConn.SetReadDeadline(time.Now().Add(readTimeout))
+		req, err := http.ReadRequest(reader)
+		if err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+				logger.LogError(fmt.Sprintf("Failed to read HTTPS request: %v", err))
+			}
+			return
+		}
+		_ = tlsConn.SetReadDeadline(time.Time{})
+
+		if !h.serveSingleHTTPSRequest(tlsConn, req, hostname, sourceIP, upstreamPort) {
+			return
+		}
+	}
+}
+
+func (h *HTTPSHandler) serveSingleHTTPSRequest(tlsConn *tls.Conn, req *http.Request, hostname, sourceIP string, upstreamPort int) bool {
+	if req.Body != nil {
+		defer req.Body.Close()
 	}
 
-	bodyBytes := []byte{}
-	if req.Body != nil {
-		bodyBytes, _ = io.ReadAll(req.Body)
-		req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	}
+	bodyBytes, upstreamBody := readRequestBodyPreview(req)
 
 	if upstreamPort <= 0 {
 		upstreamPort = 443
@@ -509,11 +546,14 @@ func (h *HTTPSHandler) handleHTTPSRequest(tlsConn *tls.Conn, hostname, sourceIP 
 		Body:     bodyBytes,
 	})
 
-	proxyReq, err := http.NewRequest(req.Method, fullURL, bytes.NewBuffer(bodyBytes))
+	proxyReq, err := http.NewRequest(req.Method, fullURL, upstreamBody)
 	if err != nil {
 		logger.LogError(fmt.Sprintf("Failed to create proxy request: %v", err))
 		sendHTTPError(tlsConn, http.StatusInternalServerError, "Internal Server Error")
-		return
+		return false
+	}
+	if req.ContentLength > 0 && proxyReq.ContentLength <= 0 {
+		proxyReq.ContentLength = req.ContentLength
 	}
 
 	copyHeaders(proxyReq.Header, req.Header)
@@ -542,9 +582,11 @@ func (h *HTTPSHandler) handleHTTPSRequest(tlsConn *tls.Conn, hostname, sourceIP 
 			BodyPreview: []byte("Bad Gateway"),
 			Truncated:   false,
 		})
-		return
+		return false
 	}
 	defer resp.Body.Close()
+
+	keepAlive := req.ProtoAtLeast(1, 1) && !req.Close && !resp.Close
 
 	var rewritePlan *rewrites.Plan
 	if h.rewriter != nil {
@@ -571,7 +613,7 @@ func (h *HTTPSHandler) handleHTTPSRequest(tlsConn *tls.Conn, hostname, sourceIP 
 					BodyPreview: []byte("Bad Gateway"),
 					Truncated:   false,
 				})
-				return
+				return false
 			}
 
 			if len(rawBody) > maxTamperBodyBytes {
@@ -595,7 +637,7 @@ func (h *HTTPSHandler) handleHTTPSRequest(tlsConn *tls.Conn, hostname, sourceIP 
 
 				if err := resp.Write(tlsConn); err != nil {
 					logger.LogError(fmt.Sprintf("Failed to write response to client: %v", err))
-					return
+					return false
 				}
 				logger.LogHTTPSResponse(logger.ResponseLogEntry{
 					ReqID:       reqID,
@@ -607,7 +649,7 @@ func (h *HTTPSHandler) handleHTTPSRequest(tlsConn *tls.Conn, hostname, sourceIP 
 					Truncated:   preview.Truncated(),
 				})
 				logger.LogDebug(fmt.Sprintf("HTTPS completed (tampered): %s %s -> %d", req.Method, fullURL, resp.StatusCode))
-				return
+				return keepAlive
 			}
 		}
 	}
@@ -618,7 +660,7 @@ func (h *HTTPSHandler) handleHTTPSRequest(tlsConn *tls.Conn, hostname, sourceIP 
 
 	if err := resp.Write(tlsConn); err != nil {
 		logger.LogError(fmt.Sprintf("Failed to write response to client: %v", err))
-		return
+		return false
 	}
 	logger.LogHTTPSResponse(logger.ResponseLogEntry{
 		ReqID:       reqID,
@@ -631,33 +673,53 @@ func (h *HTTPSHandler) handleHTTPSRequest(tlsConn *tls.Conn, hostname, sourceIP 
 	})
 
 	logger.LogDebug(fmt.Sprintf("HTTPS completed: %s %s -> %d", req.Method, fullURL, resp.StatusCode))
+	return keepAlive
 }
 
-// extractSNI reads the ClientHello to determine the target hostname without fully consuming the handshake bytes.
-// Note: This implementation currently consumes bytes, which may require replay logic if not handled carefully.
-// (See `replayConn` structure below if strict strict replay is needed, though currently we rely on re-reading if implementation allows).
-//
-// In this specific implementation, extractSNI consumes the ClientHello bytes.
-// The caller must be aware that the `net.Conn` passed to `tls.Server` needs to have those bytes "put back" or
-// be served by a wrapper that replays them.
-
+// extractSNI reads the full TLS ClientHello record to determine the target hostname.
+// All consumed bytes are returned so the caller can replay them via replayConn.
 func (h *HTTPSHandler) extractSNI(conn net.Conn) (string, []byte, error) {
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
 
-	// Peek/Read enough bytes for ClientHello
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
+	var hdr [5]byte
+	n, err := io.ReadFull(conn, hdr[:])
 	if err != nil {
+		if n > 0 && errors.Is(err, io.ErrUnexpectedEOF) {
+			return "", append([]byte(nil), hdr[:n]...), errNoSNI
+		}
 		return "", nil, err
 	}
 
-	hostname := parseSNI(buf[:n])
-	if hostname == "" {
-		return "", buf[:n], errNoSNI
+	// 0x16 = TLS Handshake record
+	if hdr[0] != 0x16 {
+		return "", append([]byte(nil), hdr[:]...), errNoSNI
 	}
 
-	return hostname, buf[:n], nil
+	recordLen := int(hdr[3])<<8 | int(hdr[4])
+	if recordLen <= 0 {
+		return "", append([]byte(nil), hdr[:]...), errNoSNI
+	}
+	if recordLen > maxClientHelloRecordLen {
+		recordLen = maxClientHelloRecordLen
+	}
+
+	buf := make([]byte, 5+recordLen)
+	copy(buf[:5], hdr[:])
+	m, err := io.ReadFull(conn, buf[5:])
+	total := 5 + m
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		if m == 0 {
+			return "", buf[:5], err
+		}
+	}
+
+	hostname := parseSNI(buf[:total])
+	if hostname == "" {
+		return "", buf[:total], errNoSNI
+	}
+
+	return hostname, buf[:total], nil
 }
 
 // parseSNI attempts to find the Server Name Indication extension in the TLS ClientHello.
@@ -962,6 +1024,46 @@ func (rc *replayConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 	return rc.Conn.Read(b)
+}
+
+type idleTimeoutConn struct {
+	net.Conn
+	activity *tunnelActivity
+}
+
+type tunnelActivity struct {
+	conns   []net.Conn
+	timeout time.Duration
+	mu      sync.Mutex
+}
+
+func (a *tunnelActivity) refresh() {
+	if a == nil || a.timeout <= 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	deadline := time.Now().Add(a.timeout)
+	for _, conn := range a.conns {
+		_ = conn.SetDeadline(deadline)
+	}
+}
+
+func (c *idleTimeoutConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.activity.refresh()
+	}
+	return n, err
+}
+
+func (c *idleTimeoutConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.activity.refresh()
+	}
+	return n, err
 }
 
 func bufioReaderFromConn(conn net.Conn) *bufio.Reader {

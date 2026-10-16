@@ -7,6 +7,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/dmitryporotnikov/sslinspectingrouter/internal/logger"
 )
@@ -30,7 +31,19 @@ type localeOption struct {
 	URL        string `json:"url"`
 }
 
+var loadAvailableLocalesOnce = sync.OnceValues(loadAvailableLocales)
+
 func availableLocales() ([]localeOption, error) {
+	locales, err := loadAvailableLocalesOnce()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]localeOption, len(locales))
+	copy(out, locales)
+	return out, nil
+}
+
+func loadAvailableLocales() ([]localeOption, error) {
 	entries, err := fs.ReadDir(frontendFiles, "frontend/locales")
 	if err != nil {
 		return nil, err

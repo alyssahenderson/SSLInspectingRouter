@@ -88,6 +88,9 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 
 	var total int
 	countQuery := `SELECT COUNT(*)` + fromClause + whereClause
+	if whereClause == "" {
+		countQuery = `SELECT COUNT(*) FROM Requests`
+	}
 	if err := s.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to count traffic")
 		return
@@ -316,6 +319,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				writeJSONError(w, http.StatusBadRequest, err.Error())
 				return
 			}
+			s.invalidateRuntimeStatusCache()
 		}
 
 		if payload.WireGuardEnabled != nil && payload.TorEnabled != nil && *payload.WireGuardEnabled && *payload.TorEnabled {
@@ -324,6 +328,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if payload.WireGuardEnabled != nil && !*payload.WireGuardEnabled {
+			s.invalidateRuntimeStatusCache()
 			if err := s.applyWireGuardState(false); err != nil {
 				statusCode := http.StatusInternalServerError
 				if errors.Is(err, wireguard.ErrConfigNotFound) ||
@@ -334,8 +339,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				writeJSONError(w, statusCode, err.Error())
 				return
 			}
+			s.invalidateRuntimeStatusCache()
 		}
 		if payload.TorEnabled != nil && !*payload.TorEnabled {
+			s.invalidateRuntimeStatusCache()
 			if err := s.applyTorState(false); err != nil {
 				statusCode := http.StatusInternalServerError
 				if errors.Is(err, tor.ErrSOCKSUnavailable) || errors.Is(err, errMutuallyExclusiveEgress) {
@@ -344,8 +351,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				writeJSONError(w, statusCode, err.Error())
 				return
 			}
+			s.invalidateRuntimeStatusCache()
 		}
 		if payload.WireGuardEnabled != nil && *payload.WireGuardEnabled {
+			s.invalidateRuntimeStatusCache()
 			if err := s.applyWireGuardState(true); err != nil {
 				statusCode := http.StatusInternalServerError
 				if errors.Is(err, wireguard.ErrConfigNotFound) ||
@@ -356,8 +365,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				writeJSONError(w, statusCode, err.Error())
 				return
 			}
+			s.invalidateRuntimeStatusCache()
 		}
 		if payload.TorEnabled != nil && *payload.TorEnabled {
+			s.invalidateRuntimeStatusCache()
 			if err := s.applyTorState(true); err != nil {
 				statusCode := http.StatusInternalServerError
 				if errors.Is(err, tor.ErrSOCKSUnavailable) || errors.Is(err, errMutuallyExclusiveEgress) {
@@ -366,6 +377,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				writeJSONError(w, statusCode, err.Error())
 				return
 			}
+			s.invalidateRuntimeStatusCache()
 		}
 
 		status := s.currentStatusPayload()
@@ -373,6 +385,57 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeMethodNotAllowed(w, http.MethodGet, http.MethodPut, http.MethodPost)
 	}
+}
+
+const runtimeStatusCacheTTL = 3 * time.Second
+
+func (s *Server) invalidateRuntimeStatusCache() {
+	s.statusCacheMu.Lock()
+	s.cachedWGStatusAt = time.Time{}
+	s.cachedTorStatusAt = time.Time{}
+	s.statusCacheMu.Unlock()
+}
+
+func (s *Server) getWireGuardStatus() (wireguard.Status, error) {
+	now := s.now()
+	s.statusCacheMu.Lock()
+	if !s.cachedWGStatusAt.IsZero() && now.Sub(s.cachedWGStatusAt) < runtimeStatusCacheTTL {
+		st, err := s.cachedWGStatus, s.cachedWGStatusErr
+		s.statusCacheMu.Unlock()
+		return st, err
+	}
+	s.statusCacheMu.Unlock()
+
+	st, err := s.wireguardRuntime.Status()
+
+	s.statusCacheMu.Lock()
+	s.cachedWGStatus = st
+	s.cachedWGStatusErr = err
+	s.cachedWGStatusAt = s.now()
+	s.statusCacheMu.Unlock()
+
+	return st, err
+}
+
+func (s *Server) getTorStatus() (tor.Status, error) {
+	now := s.now()
+	s.statusCacheMu.Lock()
+	if !s.cachedTorStatusAt.IsZero() && now.Sub(s.cachedTorStatusAt) < runtimeStatusCacheTTL {
+		st, err := s.cachedTorStatus, s.cachedTorStatusErr
+		s.statusCacheMu.Unlock()
+		return st, err
+	}
+	s.statusCacheMu.Unlock()
+
+	st, err := s.torRuntime.Status()
+
+	s.statusCacheMu.Lock()
+	s.cachedTorStatus = st
+	s.cachedTorStatusErr = err
+	s.cachedTorStatusAt = s.now()
+	s.statusCacheMu.Unlock()
+
+	return st, err
 }
 
 func (s *Server) currentStatusPayload() map[string]any {
@@ -383,10 +446,15 @@ func (s *Server) currentStatusPayload() map[string]any {
 	}
 
 	requestCount := s.lastRequestCount.Load()
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM Requests`).Scan(&requestCount); err != nil {
-		logger.LogDebug(fmt.Sprintf("dashboard status request count query failed: %v", err))
-	} else {
+	if s.db != nil && s.db == logger.DB {
+		requestCount = logger.GetRequestCount()
 		s.lastRequestCount.Store(requestCount)
+	} else if s.db != nil {
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM Requests`).Scan(&requestCount); err != nil {
+			logger.LogDebug(fmt.Sprintf("dashboard status request count query failed: %v", err))
+		} else {
+			s.lastRequestCount.Store(requestCount)
+		}
 	}
 
 	activeSessions := s.lastActiveSession.Load()
@@ -409,7 +477,7 @@ func (s *Server) currentStatusPayload() map[string]any {
 	torReachable := false
 	torLastError := ""
 	if s.wireguardRuntime != nil {
-		wireGuardStatus, err := s.wireguardRuntime.Status()
+		wireGuardStatus, err := s.getWireGuardStatus()
 		if err != nil {
 			logger.LogDebug(fmt.Sprintf("dashboard status wireguard query failed: %v", err))
 		} else {
@@ -420,7 +488,7 @@ func (s *Server) currentStatusPayload() map[string]any {
 		}
 	}
 	if s.torRuntime != nil {
-		torStatus, err := s.torRuntime.Status()
+		torStatus, err := s.getTorStatus()
 		if err != nil {
 			logger.LogDebug(fmt.Sprintf("dashboard status tor query failed: %v", err))
 		} else {

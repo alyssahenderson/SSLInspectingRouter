@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -17,25 +18,49 @@ import (
 	"github.com/dmitryporotnikov/sslinspectingrouter/internal/logger"
 )
 
+const maxCertCacheSize = 10000
+
+type certFlight struct {
+	done chan struct{}
+	pair *CertPair
+	err  error
+}
+
 // CertManager handles the creation and storage of the Root CA and dynamic host certificates.
 type CertManager struct {
 	caCert     *x509.Certificate
 	caKey      *rsa.PrivateKey
+	leafKey    *rsa.PrivateKey
+	leafKeyID  []byte
 	certCache  map[string]*CertPair
+	inflight   map[string]*certFlight
 	cacheMutex sync.RWMutex
 }
 
-// CertPair contains a public certificate and its corresponding private key.
+// CertPair contains a public certificate, its corresponding private key, and a pre-built tls.Certificate.
 type CertPair struct {
-	Cert *x509.Certificate
-	Key  *rsa.PrivateKey
+	Cert    *x509.Certificate
+	Key     *rsa.PrivateKey
+	TLSCert tls.Certificate
 }
 
 // NewCertManager initializes the Certificate Authority (CA) and prepares the certificate cache.
 // If forceNew is true, a new CA is generated and replaces any existing files.
 func NewCertManager(forceNew bool) (*CertManager, error) {
+	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate shared leaf key: %v", err)
+	}
+	leafKeyID, err := subjectKeyID(&leafKey.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute shared leaf key id: %v", err)
+	}
+
 	cm := &CertManager{
+		leafKey:   leafKey,
+		leafKeyID: leafKeyID,
 		certCache: make(map[string]*CertPair),
+		inflight:  make(map[string]*certFlight),
 	}
 
 	if !forceNew {
@@ -150,31 +175,65 @@ func (cm *CertManager) loadCA(certPath, keyPath string) error {
 }
 
 // GetCertificateForHost returns a valid certificate for the specific hostname.
-// If one exists in cache, it is returned. Otherwise, a new one is dynamically signed by the internal CA.
+// If one exists in cache and is not expired, it is returned. Otherwise, a new one is dynamically signed by the internal CA.
 func (cm *CertManager) GetCertificateForHost(hostname string) (*CertPair, error) {
+	now := time.Now()
+
 	cm.cacheMutex.RLock()
-	if certPair, exists := cm.certCache[hostname]; exists {
+	if certPair, exists := cm.certCache[hostname]; exists && now.Before(certPair.Cert.NotAfter) {
 		cm.cacheMutex.RUnlock()
 		return certPair, nil
 	}
 	cm.cacheMutex.RUnlock()
 
 	cm.cacheMutex.Lock()
-	defer cm.cacheMutex.Unlock()
-
-	// Double-checked locking
-	if certPair, exists := cm.certCache[hostname]; exists {
+	if certPair, exists := cm.certCache[hostname]; exists && now.Before(certPair.Cert.NotAfter) {
+		cm.cacheMutex.Unlock()
 		return certPair, nil
 	}
-
-	hostKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate host key: %v", err)
+	if flight, ok := cm.inflight[hostname]; ok {
+		cm.cacheMutex.Unlock()
+		<-flight.done
+		return flight.pair, flight.err
 	}
+	flight := &certFlight{done: make(chan struct{})}
+	cm.inflight[hostname] = flight
+	cm.cacheMutex.Unlock()
 
-	hostKeyID, err := subjectKeyID(&hostKey.PublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compute host key id: %v", err)
+	certPair, err := cm.generateHostCert(hostname)
+
+	cm.cacheMutex.Lock()
+	delete(cm.inflight, hostname)
+	if err == nil {
+		if len(cm.certCache) >= maxCertCacheSize {
+			cm.evictCacheLocked(now)
+		}
+		cm.certCache[hostname] = certPair
+	}
+	flight.pair = certPair
+	flight.err = err
+	close(flight.done)
+	cm.cacheMutex.Unlock()
+
+	if err == nil {
+		logger.LogDebug(fmt.Sprintf("Certificate generated for: %s", hostname))
+	}
+	return certPair, err
+}
+
+func (cm *CertManager) generateHostCert(hostname string) (*CertPair, error) {
+	hostKey := cm.leafKey
+	hostKeyID := cm.leafKeyID
+	if hostKey == nil {
+		var err error
+		hostKey, err = rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate host key: %v", err)
+		}
+		hostKeyID, err = subjectKeyID(&hostKey.PublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compute host key id: %v", err)
+		}
 	}
 
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
@@ -182,14 +241,15 @@ func (cm *CertManager) GetCertificateForHost(hostname string) (*CertPair, error)
 		return nil, fmt.Errorf("failed to generate serial number: %v", err)
 	}
 
+	now := time.Now()
 	hostTemplate := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization: []string{"SSL Proxy"},
 			CommonName:   hostname,
 		},
-		NotBefore:             time.Now().Add(-10 * time.Minute),
-		NotAfter:              time.Now().AddDate(1, 0, 0),
+		NotBefore:             now.Add(-10 * time.Minute),
+		NotAfter:              now.AddDate(1, 0, 0),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
@@ -215,12 +275,31 @@ func (cm *CertManager) GetCertificateForHost(hostname string) (*CertPair, error)
 	certPair := &CertPair{
 		Cert: hostCert,
 		Key:  hostKey,
+		TLSCert: tls.Certificate{
+			Certificate: [][]byte{hostCert.Raw, cm.caCert.Raw},
+			PrivateKey:  hostKey,
+			Leaf:        hostCert,
+		},
 	}
 
-	cm.certCache[hostname] = certPair
-	logger.LogDebug(fmt.Sprintf("Certificate generated for: %s", hostname))
-
 	return certPair, nil
+}
+
+func (cm *CertManager) evictCacheLocked(now time.Time) {
+	for host, pair := range cm.certCache {
+		if !now.Before(pair.Cert.NotAfter) {
+			delete(cm.certCache, host)
+		}
+	}
+	if len(cm.certCache) < maxCertCacheSize {
+		return
+	}
+	for host := range cm.certCache {
+		delete(cm.certCache, host)
+		if len(cm.certCache) < maxCertCacheSize {
+			break
+		}
+	}
 }
 
 func (cm *CertManager) GetCACert() *x509.Certificate {

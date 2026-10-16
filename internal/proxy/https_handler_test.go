@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -119,4 +120,83 @@ func (c *stubTunnelConn) SetReadDeadline(_ time.Time) error {
 
 func (c *stubTunnelConn) SetWriteDeadline(_ time.Time) error {
 	return nil
+}
+
+type deadlineRecordingConn struct {
+	stubTunnelConn
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (c *deadlineRecordingConn) SetDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deadline = deadline
+	return nil
+}
+
+func (c *deadlineRecordingConn) currentDeadline() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deadline
+}
+
+func TestTunnelActivityRefreshesBothConnectionDeadlines(t *testing.T) {
+	clientConn := &deadlineRecordingConn{}
+	upstreamConn := &deadlineRecordingConn{}
+	activity := &tunnelActivity{
+		conns:   []net.Conn{clientConn, upstreamConn},
+		timeout: time.Minute,
+	}
+	upstream := &idleTimeoutConn{Conn: upstreamConn, activity: activity}
+
+	activity.refresh()
+	initialClientDeadline := clientConn.currentDeadline()
+	initialUpstreamDeadline := upstreamConn.currentDeadline()
+	if _, err := upstream.Write([]byte("progress")); err != nil {
+		t.Fatalf("upstream Write: %v", err)
+	}
+
+	if !clientConn.currentDeadline().After(initialClientDeadline) {
+		t.Fatal("activity did not refresh the client connection deadline")
+	}
+	if !upstreamConn.currentDeadline().After(initialUpstreamDeadline) {
+		t.Fatal("activity did not refresh the upstream connection deadline")
+	}
+}
+
+func TestExtractSNIReadsFragmentedClientHello(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	// Build a large ClientHello (> 2000 bytes, simulating PQ key shares) with SNI at the end.
+	paddingPayload := make([]byte, 2000)
+	helloBytes := buildClientHello("pq.example.com", []uint16{0x1301, 0xc02f}, []string{"http/1.1"}, map[uint16][]byte{
+		0x0015: paddingPayload,
+	})
+
+	go func() {
+		// Write the ClientHello across multiple small chunks to simulate TCP segmentation.
+		for offset := 0; offset < len(helloBytes); {
+			end := offset + 120
+			if end > len(helloBytes) {
+				end = len(helloBytes)
+			}
+			_, _ = clientConn.Write(helloBytes[offset:end])
+			offset = end
+		}
+	}()
+
+	handler := &HTTPSHandler{}
+	hostname, replay, err := handler.extractSNI(serverConn)
+	if err != nil {
+		t.Fatalf("extractSNI error = %v, want nil", err)
+	}
+	if hostname != "pq.example.com" {
+		t.Fatalf("hostname = %q, want %q", hostname, "pq.example.com")
+	}
+	if len(replay) != len(helloBytes) {
+		t.Fatalf("len(replay) = %d, want %d", len(replay), len(helloBytes))
+	}
 }

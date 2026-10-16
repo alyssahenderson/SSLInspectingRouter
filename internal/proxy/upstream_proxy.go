@@ -1,15 +1,63 @@
 package proxy
 
 import (
+	"bytes"
+	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/dmitryporotnikov/sslinspectingrouter/internal/logger"
 	xproxy "golang.org/x/net/proxy"
 )
+
+func newUpstreamTransport(tlsConfig *tls.Config) *http.Transport {
+	var tr *http.Transport
+	if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok && defaultTransport != nil {
+		tr = defaultTransport.Clone()
+	} else {
+		tr = &http.Transport{}
+	}
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	tr.DialContext = dialer.DialContext
+	tr.ForceAttemptHTTP2 = false
+	tr.MaxIdleConns = 256
+	tr.MaxIdleConnsPerHost = 32
+	tr.IdleConnTimeout = 90 * time.Second
+	tr.TLSHandshakeTimeout = 10 * time.Second
+	if tlsConfig != nil {
+		tr.TLSClientConfig = tlsConfig
+		tr.ForceAttemptHTTP2 = false
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
+	return tr
+}
+
+func readRequestBodyPreview(req *http.Request) ([]byte, io.Reader) {
+	if req == nil || req.Body == nil || req.Body == http.NoBody {
+		return []byte{}, bytes.NewReader(nil)
+	}
+	limit := logger.LogBodyLimit()
+	if limit <= 0 {
+		limit = logger.MaxUntruncatedBytes
+	}
+	buf, _ := io.ReadAll(io.LimitReader(req.Body, int64(limit)+1))
+	if len(buf) <= limit {
+		_ = req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewReader(buf))
+		return buf, bytes.NewReader(buf)
+	}
+	combined := io.MultiReader(bytes.NewReader(buf), req.Body)
+	req.Body = io.NopCloser(combined)
+	return buf, combined
+}
 
 type socksDialer interface {
 	Dial(network, address string) (net.Conn, error)

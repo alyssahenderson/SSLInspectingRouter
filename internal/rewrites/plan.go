@@ -103,7 +103,8 @@ func (p *Plan) RewriteBody(h http.Header, rawBody []byte) ([]byte, bool, error) 
 	for _, op := range p.bodyOps {
 		switch op.typ {
 		case bodyOpReplace:
-			if !bytes.Contains(modified, op.from) {
+			idx := bytes.Index(modified, op.from)
+			if idx < 0 {
 				continue
 			}
 			modified = bytes.ReplaceAll(modified, op.from, op.to)

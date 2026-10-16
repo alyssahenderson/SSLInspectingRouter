@@ -54,12 +54,27 @@ func resolveFakeIP(fqdn string) net.IP {
 	return net.IPv4(10, 200, hash[1], hash[2])
 }
 
+const (
+	maxSegmentSize = 1460
+	maxActiveFlows = 10000
+)
+
 func (m *Manager) GetOrCreateFlow(reqID int64, srcIPStr, fqdn string) *Flow {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.getOrCreateFlowLocked(reqID, srcIPStr, fqdn)
+}
 
+func (m *Manager) getOrCreateFlowLocked(reqID int64, srcIPStr, fqdn string) *Flow {
 	if flow, ok := m.flows[reqID]; ok {
 		return flow
+	}
+
+	if len(m.flows) >= maxActiveFlows {
+		for id := range m.flows {
+			delete(m.flows, id)
+			break
+		}
 	}
 
 	srcIP := net.ParseIP(srcIPStr)
@@ -86,45 +101,66 @@ func (m *Manager) WriteRequest(reqID int64, srcIPStr, fqdn string, body []byte) 
 	if m == nil {
 		return
 	}
-	flow := m.GetOrCreateFlow(reqID, srcIPStr, fqdn)
 
-	// Simulate handshake only on first packet? simplifying to just PSH/ACK for now
-	// To make it look real, we should probably do a handshake. But Wireshark
-	// can often tolerate missing handshakes if we just send data.
-
-	// Server -> Client (ACK previous if any)
-	// Client -> Server (PSH, ACK) containing request
-
-	pkt := m.buildPacket(flow.SrcIP, flow.DstIP, flow.SrcPort, flow.DstPort, flow.Seq, flow.Ack, 0x18, body) // PSH|ACK
-	m.writer.WritePacket(pkt)
-
+	m.mu.Lock()
+	flow := m.getOrCreateFlowLocked(reqID, srcIPStr, fqdn)
+	srcIP := flow.SrcIP
+	dstIP := flow.DstIP
+	srcPort := flow.SrcPort
+	dstPort := flow.DstPort
+	seq := flow.Seq
+	ack := flow.Ack
 	flow.Seq += uint32(len(body))
+	m.mu.Unlock()
+
+	m.writeSegmented(srcIP, dstIP, srcPort, dstPort, seq, ack, body)
 }
 
 func (m *Manager) WriteResponse(reqID int64, srcIPStr, fqdn string, body []byte) {
 	if m == nil {
 		return
 	}
-	// We need the same flow to get correct Seq/Ack
+
 	m.mu.Lock()
 	flow, ok := m.flows[reqID]
+	if !ok {
+		flow = m.getOrCreateFlowLocked(reqID, srcIPStr, fqdn)
+	}
+	srcIP := flow.DstIP
+	dstIP := flow.SrcIP
+	srcPort := flow.DstPort
+	dstPort := flow.SrcPort
+	seq := flow.Ack
+	ack := flow.Seq
+	flow.Ack += uint32(len(body))
+	delete(m.flows, reqID)
 	m.mu.Unlock()
 
-	if !ok {
-		// Should create if missing (e.g. restart) but usually should exist
-		flow = m.GetOrCreateFlow(reqID, srcIPStr, fqdn)
+	m.writeSegmented(srcIP, dstIP, srcPort, dstPort, seq, ack, body)
+}
+
+func (m *Manager) writeSegmented(srcIP, dstIP net.IP, srcPort, dstPort int, seq, ack uint32, body []byte) {
+	if len(body) == 0 {
+		pkt := m.buildPacket(srcIP, dstIP, srcPort, dstPort, seq, ack, 0x18, body)
+		_ = m.writer.WritePacket(pkt)
+		return
 	}
 
-	// Server -> Client (PSH, ACK) containing response
-	// ACK should acknowledge the request bytes
-
-	pkt := m.buildPacket(flow.DstIP, flow.SrcIP, flow.DstPort, flow.SrcPort, flow.Ack, flow.Seq, 0x18, body) // PSH|ACK swaps roles
-	m.writer.WritePacket(pkt)
-
-	// Update Flow State (The Server's sequence advances, Client's ACK advances)
-	flow.Ack += uint32(len(body))
-
-	// Clean up flow to save memory? keep for now
+	numSegments := (len(body) + maxSegmentSize - 1) / maxSegmentSize
+	packets := make([][]byte, 0, numSegments)
+	for offset := 0; offset < len(body); offset += maxSegmentSize {
+		end := offset + maxSegmentSize
+		flags := byte(0x10) // ACK
+		if end >= len(body) {
+			end = len(body)
+			flags = 0x18 // PSH|ACK on final segment
+		}
+		chunk := body[offset:end]
+		pkt := m.buildPacket(srcIP, dstIP, srcPort, dstPort, seq, ack, flags, chunk)
+		packets = append(packets, pkt)
+		seq += uint32(len(chunk))
+	}
+	_ = m.writer.WritePackets(packets)
 }
 
 func (m *Manager) buildPacket(src, dst net.IP, srcPort, dstPort int, seq, ack uint32, flags byte, payload []byte) []byte {

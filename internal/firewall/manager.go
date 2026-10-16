@@ -58,6 +58,41 @@ type Rule struct {
 	Match     RuleMatch `json:"match"`
 	CreatedAt string    `json:"created_at,omitempty"`
 	UpdatedAt string    `json:"updated_at,omitempty"`
+
+	compiled *compiledMatch
+}
+
+type compiledMatch struct {
+	hostLower   string
+	hostRegex   *regexp.Regexp
+	hostRegexOK bool
+	parsedIP    net.IP
+	ipLower     string
+	ipNet       *net.IPNet
+	cidrOK      bool
+}
+
+func compileRule(r *Rule) {
+	cm := &compiledMatch{
+		hostLower: strings.ToLower(strings.TrimSpace(r.Match.Host)),
+		ipLower:   strings.TrimSpace(r.Match.IP),
+	}
+	if r.Match.HostRegex != "" {
+		if re, err := regexp.Compile(r.Match.HostRegex); err == nil {
+			cm.hostRegex = re
+			cm.hostRegexOK = true
+		}
+	}
+	if cm.ipLower != "" {
+		cm.parsedIP = net.ParseIP(cm.ipLower)
+	}
+	if r.Match.CIDR != "" {
+		if _, ipNet, err := net.ParseCIDR(r.Match.CIDR); err == nil {
+			cm.ipNet = ipNet
+			cm.cidrOK = true
+		}
+	}
+	r.compiled = cm
 }
 
 type Manager struct {
@@ -185,6 +220,7 @@ func (m *Manager) loadRules() error {
 	defer m.mu.Unlock()
 
 	var maxID int64 = 0
+	var legacyIDs []int64
 	for rows.Next() {
 		var rule Rule
 		var enabled int
@@ -201,13 +237,20 @@ func (m *Manager) loadRules() error {
 			return err
 		}
 		if isLegacySeededBlockAllRule(rule) {
-			go m.deleteRuleFromDB(rule.ID)
+			legacyIDs = append(legacyIDs, rule.ID)
 			continue
 		}
+		compileRule(&rule)
 		m.rules = append(m.rules, rule)
 		if rule.ID > maxID {
 			maxID = rule.ID
 		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range legacyIDs {
+		_ = m.deleteRuleFromDB(id)
 	}
 	m.nextID = maxID + 1
 
@@ -322,11 +365,13 @@ func (m *Manager) IsEnabled() bool {
 func (m *Manager) SetEnabled(enabled bool) {
 	m.mu.Lock()
 	m.enabled = enabled
+	if err := m.saveEnabledState(); err != nil {
+		logger.LogError(fmt.Sprintf("Failed to save firewall enabled state: %v", err))
+	}
 	callback := m.onEnabledChange
 	entriesCopy := append([]OutboundPortEntry(nil), m.outboundPorts...)
 	m.mu.Unlock()
 
-	go m.saveEnabledState()
 	if callback != nil {
 		callback(enabled, entriesCopy)
 	}
@@ -371,12 +416,14 @@ func (m *Manager) SetOutboundPorts(entries []OutboundPortEntry) {
 
 	m.mu.Lock()
 	m.outboundPorts = normalized
+	if err := m.saveOutboundPorts(); err != nil {
+		logger.LogError(fmt.Sprintf("Failed to save firewall outbound ports: %v", err))
+	}
 	enabled := m.enabled
 	callback := m.onEnabledChange
 	entriesCopy := append([]OutboundPortEntry(nil), m.outboundPorts...)
 	m.mu.Unlock()
 
-	go m.saveOutboundPorts()
 	if callback != nil {
 		callback(enabled, entriesCopy)
 	}
@@ -395,7 +442,8 @@ func (m *Manager) GetRuleByID(id int64) *Rule {
 	defer m.mu.RUnlock()
 	for _, rule := range m.rules {
 		if rule.ID == id {
-			return &rule
+			ruleCopy := rule
+			return &ruleCopy
 		}
 	}
 	return nil
@@ -408,11 +456,14 @@ func (m *Manager) AddRule(rule Rule) Rule {
 	m.nextID++
 	rule.CreatedAt = time.Now().UTC().Format(time.RFC3339)
 	rule.UpdatedAt = rule.CreatedAt
+	compileRule(&rule)
 	m.rules = append(m.rules, rule)
 	m.sortRulesByPriority()
+	if err := m.saveRule(rule); err != nil {
+		logger.LogError(fmt.Sprintf("Failed to save firewall rule %d: %v", rule.ID, err))
+	}
 	m.notifyRuleChange()
 	logger.LogInfo(fmt.Sprintf("Firewall rule added: id=%d action=%s", rule.ID, rule.Action))
-	go m.saveRule(rule)
 	return rule
 }
 
@@ -427,11 +478,15 @@ func (m *Manager) UpdateRule(id int64, updates Rule) *Rule {
 			m.rules[i].BlockMode = updates.BlockMode
 			m.rules[i].Match = updates.Match
 			m.rules[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+			compileRule(&m.rules[i])
+			updated := m.rules[i]
 			m.sortRulesByPriority()
+			if err := m.saveRule(updated); err != nil {
+				logger.LogError(fmt.Sprintf("Failed to update firewall rule %d: %v", id, err))
+			}
 			m.notifyRuleChange()
 			logger.LogInfo(fmt.Sprintf("Firewall rule updated: id=%d", id))
-			go m.saveRule(m.rules[i])
-			return &m.rules[i]
+			return &updated
 		}
 	}
 	return nil
@@ -443,9 +498,11 @@ func (m *Manager) DeleteRule(id int64) bool {
 	for i, rule := range m.rules {
 		if rule.ID == id {
 			m.rules = append(m.rules[:i], m.rules[i+1:]...)
+			if err := m.deleteRuleFromDB(id); err != nil {
+				logger.LogError(fmt.Sprintf("Failed to delete firewall rule %d: %v", id, err))
+			}
 			m.notifyRuleChange()
 			logger.LogInfo(fmt.Sprintf("Firewall rule deleted: id=%d", id))
-			go m.deleteRuleFromDB(id)
 			return true
 		}
 	}
@@ -455,7 +512,12 @@ func (m *Manager) DeleteRule(id int64) bool {
 func (m *Manager) SetRules(rules []Rule) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.rules = rules
+	compiled := make([]Rule, len(rules))
+	copy(compiled, rules)
+	for i := range compiled {
+		compileRule(&compiled[i])
+	}
+	m.rules = compiled
 	m.sortRulesByPriority()
 	m.notifyRuleChange()
 	logger.LogInfo(fmt.Sprintf("Firewall rules replaced: count=%d", len(rules)))
@@ -505,41 +567,53 @@ func (m *Manager) MatchTraffic(host, ip string) (action Action, blockMode BlockM
 		return "", "", false
 	}
 
+	hostLower := strings.ToLower(strings.TrimSpace(host))
+	ipTrimmed := strings.TrimSpace(ip)
+	var parsedIP net.IP
+	if ipTrimmed != "" {
+		parsedIP = net.ParseIP(ipTrimmed)
+	}
+
 	for _, rule := range m.rules {
 		if !rule.Enabled {
 			continue
 		}
 
-		if m.ruleMatches(rule, host, ip) {
+		if m.ruleMatches(rule, host, hostLower, ipTrimmed, parsedIP) {
 			return rule.Action, rule.BlockMode, true
 		}
 	}
 	return "", "", false
 }
 
-func (m *Manager) ruleMatches(rule Rule, host, ip string) bool {
+func (m *Manager) ruleMatches(rule Rule, host, hostLower, ip string, parsedIP net.IP) bool {
 	ruleMatch := rule.Match
+	cm := rule.compiled
+	if cm == nil {
+		compileRule(&rule)
+		cm = rule.compiled
+	}
 
-	if ruleMatch.Host != "" && host != "" {
-		if ruleMatch.Host == host || (len(host) > len(ruleMatch.Host) && host[len(host)-len(ruleMatch.Host)-1:] == "."+ruleMatch.Host) {
+	if cm.hostLower != "" && hostLower != "" {
+		if cm.hostLower == hostLower || (len(hostLower) > len(cm.hostLower) && hostLower[len(hostLower)-len(cm.hostLower)-1:] == "."+cm.hostLower) {
 			return true
 		}
 	}
 
 	if ruleMatch.HostRegex != "" && host != "" {
-		if matchHostRegex(host, ruleMatch.HostRegex) {
+		if cm.hostRegexOK && cm.hostRegex.MatchString(host) {
 			return true
 		}
 	}
 
-	if ruleMatch.IP != "" && ip != "" {
-		if ruleMatch.IP == ip {
+	if cm.ipLower != "" && ip != "" {
+		if cm.ipLower == ip || (cm.parsedIP != nil && parsedIP != nil && cm.parsedIP.Equal(parsedIP)) {
 			return true
 		}
 	}
 
-	if ruleMatch.CIDR != "" && ip != "" {
-		if matchCIDR(ip, ruleMatch.CIDR) {
+	if ruleMatch.CIDR != "" && parsedIP != nil {
+		if cm.cidrOK && cm.ipNet.Contains(parsedIP) {
 			return true
 		}
 	}

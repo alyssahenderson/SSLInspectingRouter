@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +37,7 @@ func NewHTTPHandler(blockList *blocklist.BlockList, bypassList *blocklist.BlockL
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
+			Transport: newUpstreamTransport(nil),
 		},
 		blockList:  blockList,
 		bypassList: bypassList,
@@ -130,11 +130,7 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	logger.LogDebug(fmt.Sprintf("HTTP request from %s: %s %s", sourceIP, r.Method, fullURL))
 
-	bodyBytes := []byte{}
-	if r.Body != nil {
-		bodyBytes, _ = io.ReadAll(r.Body)
-		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	}
+	bodyBytes, upstreamBody := readRequestBodyPreview(r)
 
 	fm := firewall.GetManager()
 	if fm.IsEnabled() {
@@ -220,7 +216,7 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, fullURL, bytes.NewBuffer(bodyBytes))
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, fullURL, upstreamBody)
 	if err != nil {
 		logger.LogError(fmt.Sprintf("Failed to create proxy request: %v", err))
 		writePlainError(w, http.StatusInternalServerError, "Proxy Error")
@@ -228,6 +224,9 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			logger.LogBypassedResponse(reqID, sourceIP, targetHost)
 		}
 		return
+	}
+	if r.ContentLength > 0 && proxyReq.ContentLength <= 0 {
+		proxyReq.ContentLength = r.ContentLength
 	}
 
 	copyHeaders(proxyReq.Header, r.Header)
