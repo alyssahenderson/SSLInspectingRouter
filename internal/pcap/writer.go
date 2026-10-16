@@ -1,6 +1,7 @@
 package pcap
 
 import (
+	"bufio"
 	"encoding/binary"
 	"os"
 	"sync"
@@ -19,6 +20,7 @@ const (
 
 type Writer struct {
 	file  *os.File
+	buf   *bufio.Writer
 	mu    sync.Mutex
 	start time.Time
 }
@@ -31,6 +33,7 @@ func NewWriter(filename string) (*Writer, error) {
 
 	w := &Writer{
 		file:  f,
+		buf:   bufio.NewWriterSize(f, 64*1024),
 		start: time.Now(),
 	}
 
@@ -45,13 +48,34 @@ func NewWriter(filename string) (*Writer, error) {
 func (w *Writer) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.buf != nil {
+		_ = w.buf.Flush()
+	}
 	return w.file.Close()
 }
 
 func (w *Writer) WritePacket(data []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.writePacket(data, time.Now())
+	if err := w.writePacket(data, time.Now()); err != nil {
+		return err
+	}
+	return w.buf.Flush()
+}
+
+func (w *Writer) WritePackets(packets [][]byte) error {
+	if len(packets) == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	now := time.Now()
+	for _, pkt := range packets {
+		if err := w.writePacket(pkt, now); err != nil {
+			return err
+		}
+	}
+	return w.buf.Flush()
 }
 
 func (w *Writer) writeGlobalHeader() error {
@@ -65,8 +89,10 @@ func (w *Writer) writeGlobalHeader() error {
 	binary.LittleEndian.PutUint32(buf[16:20], uint32(snapLen))
 	binary.LittleEndian.PutUint32(buf[20:24], uint32(networkLL))
 
-	_, err := w.file.Write(buf)
-	return err
+	if _, err := w.buf.Write(buf); err != nil {
+		return err
+	}
+	return w.buf.Flush()
 }
 
 func (w *Writer) writePacket(data []byte, t time.Time) error {
@@ -76,16 +102,16 @@ func (w *Writer) writePacket(data []byte, t time.Time) error {
 	// uint32 incl_len
 	// uint32 orig_len
 
-	header := make([]byte, 16)
+	var header [16]byte
 	binary.LittleEndian.PutUint32(header[0:4], uint32(t.Unix()))
 	binary.LittleEndian.PutUint32(header[4:8], uint32(t.Nanosecond()/1000))
 	binary.LittleEndian.PutUint32(header[8:12], uint32(len(data)))
 	binary.LittleEndian.PutUint32(header[12:16], uint32(len(data)))
 
-	if _, err := w.file.Write(header); err != nil {
+	if _, err := w.buf.Write(header[:]); err != nil {
 		return err
 	}
-	if _, err := w.file.Write(data); err != nil {
+	if _, err := w.buf.Write(data); err != nil {
 		return err
 	}
 	return nil

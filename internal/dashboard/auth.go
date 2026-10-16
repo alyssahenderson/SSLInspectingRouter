@@ -247,17 +247,19 @@ func verifyPassword(password, encodedHash string) bool {
 }
 
 func derivePasswordHash(password string, salt []byte, iterations int) []byte {
-	seed := append([]byte{}, salt...)
-	seed = append(seed, []byte(password)...)
-	sum := sha256.Sum256(seed)
-	current := sum[:]
+	passwordBytes := []byte(password)
+	h := sha256.New()
+	_, _ = h.Write(salt)
+	_, _ = h.Write(passwordBytes)
+	var buf [sha256.Size]byte
+	current := h.Sum(buf[:0])
 
 	for i := 1; i < iterations; i++ {
-		h := sha256.New()
+		h.Reset()
 		_, _ = h.Write(current)
 		_, _ = h.Write(salt)
-		_, _ = h.Write([]byte(password))
-		current = h.Sum(nil)
+		_, _ = h.Write(passwordBytes)
+		current = h.Sum(buf[:0])
 	}
 
 	result := make([]byte, len(current))
@@ -329,13 +331,15 @@ func (s *Server) authenticateRequest(r *http.Request) (*DashboardUser, string, e
 	}
 
 	tokenHash := s.sessionTokenHash(token)
-	now := s.now().UTC().Format(time.RFC3339Nano)
+	nowTime := s.now().UTC()
+	now := nowTime.Format(time.RFC3339Nano)
 
 	var (
 		user       DashboardUser
 		activeFlag int
 		lastLogin  sql.NullString
 		sessionID  int64
+		lastSeen   string
 	)
 
 	query := `
@@ -348,7 +352,8 @@ func (s *Server) authenticateRequest(r *http.Request) (*DashboardUser, string, e
 			u.created_at,
 			u.updated_at,
 			u.last_login_at,
-			s.id
+			s.id,
+			s.last_seen_at
 		FROM Sessions s
 		JOIN Users u ON u.id = s.user_id
 		WHERE s.token_hash = ? AND s.expires_at > ?
@@ -369,6 +374,7 @@ func (s *Server) authenticateRequest(r *http.Request) (*DashboardUser, string, e
 			&user.UpdatedAt,
 			&lastLogin,
 			&sessionID,
+			&lastSeen,
 		)
 		if err == nil {
 			lastErr = nil
@@ -399,8 +405,16 @@ func (s *Server) authenticateRequest(r *http.Request) (*DashboardUser, string, e
 		user.LastLoginAt = &value
 	}
 
-	if err := s.touchSession(sessionID, now); err != nil {
-		logger.LogDebug(fmt.Sprintf("dashboard session last_seen update failed: %v", err))
+	shouldTouch := true
+	if parsedLastSeen, err := time.Parse(time.RFC3339Nano, lastSeen); err == nil {
+		if nowTime.Sub(parsedLastSeen) < time.Minute {
+			shouldTouch = false
+		}
+	}
+	if shouldTouch {
+		if err := s.touchSession(sessionID, now); err != nil {
+			logger.LogDebug(fmt.Sprintf("dashboard session last_seen update failed: %v", err))
+		}
 	}
 	return &user, tokenHash, nil
 }

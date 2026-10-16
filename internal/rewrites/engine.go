@@ -21,10 +21,14 @@ type Engine struct {
 	dir            string
 	reloadInterval time.Duration
 
-	lastCheckUnixNano atomic.Int64
+	initialized   atomic.Bool
+	lastReloadErr atomic.Pointer[error]
 
 	mu      sync.Mutex
 	lastSig string
+
+	stopOnce sync.Once
+	stopCh   chan struct{}
 
 	rules atomic.Value // ruleSet
 }
@@ -44,9 +48,34 @@ func NewEngine(dir string) *Engine {
 	e := &Engine{
 		dir:            dir,
 		reloadInterval: 1 * time.Second,
+		stopCh:         make(chan struct{}),
 	}
 	e.rules.Store(ruleSet{})
+	go e.pollLoop()
 	return e
+}
+
+// Close stops the background rule polling goroutine.
+func (e *Engine) Close() {
+	if e == nil {
+		return
+	}
+	e.stopOnce.Do(func() {
+		close(e.stopCh)
+	})
+}
+
+func (e *Engine) pollLoop() {
+	ticker := time.NewTicker(e.reloadInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case <-ticker.C:
+			_ = e.reloadIfChanged()
+		}
+	}
 }
 
 func (e *Engine) Dir() string {
@@ -65,17 +94,22 @@ func (e *Engine) LoadNow() (Stats, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	e.initialized.Store(true)
+
 	sig, sigErr := dirSignature(e.dir)
 	if sigErr != nil {
+		e.lastReloadErr.Store(&sigErr)
 		return e.rules.Load().(ruleSet).stats(), sigErr
 	}
 
 	compiled, raw, loadErr := loadAndCompileRules(e.dir)
 	e.lastSig = sig
 	if loadErr != nil {
+		e.lastReloadErr.Store(&loadErr)
 		return e.rules.Load().(ruleSet).stats(), loadErr
 	}
 
+	e.lastReloadErr.Store(nil)
 	e.rules.Store(ruleSet{rules: compiled, rawRules: raw})
 	return (ruleSet{rules: compiled}).stats(), nil
 }
@@ -108,7 +142,14 @@ func DefaultDir() string {
 // engine failed to reload updated rules; in that case the returned plan is based on
 // the last successfully loaded rule set.
 func (e *Engine) Plan(req *http.Request, targetHost string, statusCode int, respHeader http.Header) (*Plan, error) {
-	reloadErr := e.maybeReload(time.Now())
+	if !e.initialized.Load() {
+		_ = e.reloadIfChanged()
+	}
+
+	var reloadErr error
+	if errPtr := e.lastReloadErr.Load(); errPtr != nil {
+		reloadErr = *errPtr
+	}
 
 	rs := e.rules.Load().(ruleSet)
 	if len(rs.rules) == 0 {
@@ -137,7 +178,9 @@ func (e *Engine) Plan(req *http.Request, targetHost string, statusCode int, resp
 // ShouldForceGzip returns true if any enabled rule that could match this request has body rewrites.
 // The caller can use this to ensure upstream content-encoding is decodable (gzip/identity).
 func (e *Engine) ShouldForceGzip(req *http.Request, targetHost string) bool {
-	_ = e.maybeReload(time.Now())
+	if !e.initialized.Load() {
+		_ = e.reloadIfChanged()
+	}
 
 	rs := e.rules.Load().(ruleSet)
 	for _, rule := range rs.rules {
@@ -151,23 +194,15 @@ func (e *Engine) ShouldForceGzip(req *http.Request, targetHost string) bool {
 	return false
 }
 
-func (e *Engine) maybeReload(now time.Time) error {
-	last := time.Unix(0, e.lastCheckUnixNano.Load())
-	if !last.IsZero() && now.Sub(last) < e.reloadInterval {
-		return nil
-	}
-
+func (e *Engine) reloadIfChanged() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	last = time.Unix(0, e.lastCheckUnixNano.Load())
-	if !last.IsZero() && now.Sub(last) < e.reloadInterval {
-		return nil
-	}
-	e.lastCheckUnixNano.Store(now.UnixNano())
+	e.initialized.Store(true)
 
 	sig, sigErr := dirSignature(e.dir)
 	if sigErr != nil {
+		e.lastReloadErr.Store(&sigErr)
 		return sigErr
 	}
 	if sig == e.lastSig {
@@ -177,9 +212,11 @@ func (e *Engine) maybeReload(now time.Time) error {
 	compiled, raw, loadErr := loadAndCompileRules(e.dir)
 	e.lastSig = sig
 	if loadErr != nil {
+		e.lastReloadErr.Store(&loadErr)
 		return loadErr
 	}
 
+	e.lastReloadErr.Store(nil)
 	e.rules.Store(ruleSet{rules: compiled, rawRules: raw})
 	return nil
 }

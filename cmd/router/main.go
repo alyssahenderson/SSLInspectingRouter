@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/dmitryporotnikov/sslinspectingrouter/internal/banner"
 	"github.com/dmitryporotnikov/sslinspectingrouter/internal/blocklist"
@@ -254,8 +255,10 @@ func main() {
 	go func() {
 		logger.LogInfo(fmt.Sprintf("HTTP proxy listening on :%d", HTTP_PROXY_PORT))
 		httpServer := &http.Server{
-			Addr:    fmt.Sprintf(":%d", HTTP_PROXY_PORT),
-			Handler: httpHandler,
+			Addr:              fmt.Sprintf(":%d", HTTP_PROXY_PORT),
+			Handler:           httpHandler,
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       60 * time.Second,
 		}
 		if err := httpServer.ListenAndServe(); err != nil {
 			logger.LogError(fmt.Sprintf("HTTP proxy error: %v", err))

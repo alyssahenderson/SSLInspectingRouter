@@ -120,3 +120,39 @@ func (c *stubTunnelConn) SetReadDeadline(_ time.Time) error {
 func (c *stubTunnelConn) SetWriteDeadline(_ time.Time) error {
 	return nil
 }
+
+func TestExtractSNIReadsFragmentedClientHello(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	// Build a large ClientHello (> 2000 bytes, simulating PQ key shares) with SNI at the end.
+	paddingPayload := make([]byte, 2000)
+	helloBytes := buildClientHello("pq.example.com", []uint16{0x1301, 0xc02f}, []string{"http/1.1"}, map[uint16][]byte{
+		0x0015: paddingPayload,
+	})
+
+	go func() {
+		// Write the ClientHello across multiple small chunks to simulate TCP segmentation.
+		for offset := 0; offset < len(helloBytes); {
+			end := offset + 120
+			if end > len(helloBytes) {
+				end = len(helloBytes)
+			}
+			_, _ = clientConn.Write(helloBytes[offset:end])
+			offset = end
+		}
+	}()
+
+	handler := &HTTPSHandler{}
+	hostname, replay, err := handler.extractSNI(serverConn)
+	if err != nil {
+		t.Fatalf("extractSNI error = %v, want nil", err)
+	}
+	if hostname != "pq.example.com" {
+		t.Fatalf("hostname = %q, want %q", hostname, "pq.example.com")
+	}
+	if len(replay) != len(helloBytes) {
+		t.Fatalf("len(replay) = %d, want %d", len(replay), len(helloBytes))
+	}
+}

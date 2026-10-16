@@ -2,6 +2,7 @@ package logger
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,6 +26,11 @@ var (
 	consoleLogs  atomic.Bool
 	DB           *sql.DB
 
+	stmtDB         *sql.DB
+	insertReqStmt  *sql.Stmt
+	insertRespStmt *sql.Stmt
+	requestCount   atomic.Int64
+
 	bodyArtifactMu      sync.RWMutex
 	bodyArtifactEnabled bool
 	bodyArtifactDir     string
@@ -36,6 +42,7 @@ var (
 const (
 	logDBFile             = "traffic.db"
 	MaxContentBytes       = 4096
+	MaxUntruncatedBytes   = 1 << 20
 	consoleRequestsOnly   = true
 	bodyArtifactSubfolder = "body-artifacts"
 )
@@ -116,7 +123,11 @@ func LogBodyLimit() int {
 	if truncateLogs.Load() {
 		return MaxContentBytes
 	}
-	return -1
+	return MaxUntruncatedBytes
+}
+
+func GetRequestCount() int64 {
+	return requestCount.Load()
 }
 
 func init() {
@@ -195,6 +206,16 @@ func InitLogger() error {
 		return fmt.Errorf("failed to create Responses table: %v", err)
 	}
 
+	for _, idxStmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_requests_fqdn ON Requests(fqdn)`,
+		`CREATE INDEX IF NOT EXISTS idx_requests_source_ip ON Requests(source_ip)`,
+		`CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON Requests(timestamp)`,
+	} {
+		if _, err := DB.Exec(idxStmt); err != nil {
+			return fmt.Errorf("failed to create Requests index: %v", err)
+		}
+	}
+
 	// Suppress default logger output; console logs are restricted to FQDN + source IP.
 	if consoleRequestsOnly {
 		log.SetOutput(io.Discard)
@@ -214,6 +235,15 @@ func InitLogger() error {
 			LogError(fmt.Sprintf("failed to apply %s: %v", pragma, err))
 		}
 	}
+
+	var initialCount int64
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM Requests`).Scan(&initialCount); err == nil {
+		requestCount.Store(initialCount)
+	}
+
+	logMutex.Lock()
+	prepareInsertStatementsLocked(DB)
+	logMutex.Unlock()
 
 	startCheckpointLoop()
 
@@ -275,6 +305,7 @@ func WipeTrafficTables(db *sql.DB) error {
 			}
 			return err
 		}
+		requestCount.Store(0)
 		return nil
 	}
 
@@ -331,6 +362,7 @@ func WipeLogDB() error {
 			return err
 		}
 	}
+	requestCount.Store(0)
 	return nil
 }
 
@@ -357,9 +389,42 @@ func WipeBodyArtifacts(customDir string) error {
 
 func CloseLogger() {
 	stopCheckpointLoop()
+	logMutex.Lock()
+	closeInsertStatementsLocked()
+	logMutex.Unlock()
 	if DB != nil {
 		DB.Close()
 	}
+}
+
+func prepareInsertStatementsLocked(db *sql.DB) {
+	if db == nil {
+		closeInsertStatementsLocked()
+		return
+	}
+	if stmtDB == db && insertReqStmt != nil && insertRespStmt != nil {
+		return
+	}
+	closeInsertStatementsLocked()
+	stmtDB = db
+	if stmt, err := db.Prepare(`INSERT INTO Requests (timestamp, source_ip, fqdn, request, content) VALUES (?, ?, ?, ?, ?)`); err == nil {
+		insertReqStmt = stmt
+	}
+	if stmt, err := db.Prepare(`INSERT INTO Responses (id, timestamp, source_ip, fqdn, response, content) VALUES (?, ?, ?, ?, ?, ?)`); err == nil {
+		insertRespStmt = stmt
+	}
+}
+
+func closeInsertStatementsLocked() {
+	if insertReqStmt != nil {
+		_ = insertReqStmt.Close()
+		insertReqStmt = nil
+	}
+	if insertRespStmt != nil {
+		_ = insertRespStmt.Close()
+		insertRespStmt = nil
+	}
+	stmtDB = nil
 }
 
 // startCheckpointLoop kicks off a background goroutine that periodically
@@ -685,13 +750,26 @@ func insertRequest(sourceIP, fqdn, requestLine, content string) (int64, error) {
 	logMutex.Lock()
 	defer logMutex.Unlock()
 
+	prepareInsertStatementsLocked(DB)
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
-	res, err := DB.Exec(`INSERT INTO Requests (timestamp, source_ip, fqdn, request, content) VALUES (?, ?, ?, ?, ?)`,
-		timestamp, sourceIP, fqdn, requestLine, content)
+	var (
+		res sql.Result
+		err error
+	)
+	if insertReqStmt != nil {
+		res, err = insertReqStmt.Exec(timestamp, sourceIP, fqdn, requestLine, content)
+	} else {
+		res, err = DB.Exec(`INSERT INTO Requests (timestamp, source_ip, fqdn, request, content) VALUES (?, ?, ?, ?, ?)`,
+			timestamp, sourceIP, fqdn, requestLine, content)
+	}
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err == nil {
+		requestCount.Add(1)
+	}
+	return id, err
 }
 
 func insertResponse(id int64, sourceIP, fqdn, responseLine, content string) {
@@ -701,10 +779,15 @@ func insertResponse(id int64, sourceIP, fqdn, responseLine, content string) {
 	logMutex.Lock()
 	defer logMutex.Unlock()
 
+	prepareInsertStatementsLocked(DB)
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
 	// Force ID to match the request ID
-	_, _ = DB.Exec(`INSERT INTO Responses (id, timestamp, source_ip, fqdn, response, content) VALUES (?, ?, ?, ?, ?, ?)`,
-		id, timestamp, sourceIP, fqdn, responseLine, content)
+	if insertRespStmt != nil {
+		_, _ = insertRespStmt.Exec(id, timestamp, sourceIP, fqdn, responseLine, content)
+	} else {
+		_, _ = DB.Exec(`INSERT INTO Responses (id, timestamp, source_ip, fqdn, response, content) VALUES (?, ?, ?, ?, ?, ?)`,
+			id, timestamp, sourceIP, fqdn, responseLine, content)
+	}
 }
 
 func formatContent(headers http.Header, body []byte) string {
@@ -890,11 +973,6 @@ func maybeStoreBodyArtifact(params ArtifactStoreParams) string {
 		return ""
 	}
 
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		LogError(fmt.Sprintf("Body artifact directory unavailable: %v", err))
-		return ""
-	}
-
 	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
 	fileName := fmt.Sprintf("%s_req%d_%s_%s_%s%s",
 		stamp,
@@ -907,8 +985,19 @@ func maybeStoreBodyArtifact(params ArtifactStoreParams) string {
 	path := filepath.Join(dir, fileName)
 
 	if err := os.WriteFile(path, params.Body, 0640); err != nil {
-		LogError(fmt.Sprintf("Failed writing body artifact %s: %v", path, err))
-		return ""
+		if errors.Is(err, os.ErrNotExist) {
+			if mkErr := os.MkdirAll(dir, 0755); mkErr != nil {
+				LogError(fmt.Sprintf("Body artifact directory unavailable: %v", mkErr))
+				return ""
+			}
+			if retryErr := os.WriteFile(path, params.Body, 0640); retryErr != nil {
+				LogError(fmt.Sprintf("Failed writing body artifact %s: %v", path, retryErr))
+				return ""
+			}
+		} else {
+			LogError(fmt.Sprintf("Failed writing body artifact %s: %v", path, err))
+			return ""
+		}
 	}
 
 	if params.Truncated {
@@ -989,13 +1078,14 @@ func bodyArtifactExt(contentType, contentEncoding string) string {
 }
 
 func truncateBytes(body []byte, max int) ([]byte, bool) {
+	limit := max
 	if !truncateLogs.Load() {
+		limit = MaxUntruncatedBytes
+	}
+	if len(body) <= limit {
 		return body, false
 	}
-	if len(body) <= max {
-		return body, false
-	}
-	return body[:max], true
+	return body[:limit], true
 }
 
 type LimitedBuffer struct {
@@ -1005,15 +1095,15 @@ type LimitedBuffer struct {
 }
 
 func (b *LimitedBuffer) Write(p []byte) (int, error) {
-	if b.Max < 0 {
-		b.Buf = append(b.Buf, p...)
-		return len(p), nil
+	max := b.Max
+	if max < 0 {
+		max = MaxUntruncatedBytes
 	}
-	if b.Max == 0 {
+	if max == 0 {
 		b.IsTruncated = b.IsTruncated || len(p) > 0
 		return len(p), nil
 	}
-	remaining := b.Max - len(b.Buf)
+	remaining := max - len(b.Buf)
 	if remaining > 0 {
 		if len(p) <= remaining {
 			b.Buf = append(b.Buf, p...)
@@ -1035,12 +1125,12 @@ func (b *LimitedBuffer) Truncated() bool {
 	return b.IsTruncated
 }
 
-// ReadBody safely reads the request body without closing it, returning the bytes.
+// ReadBody safely reads the request body up to LogBodyLimit, returning the bytes.
 func ReadBody(r *http.Request) []byte {
 	if r.Body == nil {
 		return nil
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(LogBodyLimit())))
 	if err != nil {
 		return nil
 	}
