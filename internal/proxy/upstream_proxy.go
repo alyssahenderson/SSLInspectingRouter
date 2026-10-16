@@ -27,6 +27,7 @@ func newUpstreamTransport(tlsConfig *tls.Config) *http.Transport {
 		KeepAlive: 30 * time.Second,
 	}
 	tr.DialContext = dialer.DialContext
+	tr.ForceAttemptHTTP2 = false
 	tr.MaxIdleConns = 256
 	tr.MaxIdleConnsPerHost = 32
 	tr.IdleConnTimeout = 90 * time.Second
@@ -51,10 +52,9 @@ func readRequestBodyPreview(req *http.Request) ([]byte, io.Reader) {
 		req.Body = io.NopCloser(bytes.NewReader(buf))
 		return buf, bytes.NewReader(buf)
 	}
-	preview := buf[:limit]
 	combined := io.MultiReader(bytes.NewReader(buf), req.Body)
 	req.Body = io.NopCloser(combined)
-	return preview, combined
+	return buf, combined
 }
 
 type socksDialer interface {

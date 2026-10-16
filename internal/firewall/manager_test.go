@@ -388,7 +388,26 @@ func TestMatchTrafficCaseInsensitiveHostAndPrecompiledMatchers(t *testing.T) {
 	if action, _, matched := m.MatchTraffic("sub.EXAMPLE.com", "192.168.1.5"); !matched || action != ActionBlock {
 		t.Fatalf("expected case-insensitive host match ActionBlock, got (%q, %v)", action, matched)
 	}
+
 	if action, _, matched := m.MatchTraffic("other.org", "10.10.5.9"); !matched || action != ActionBypass {
 		t.Fatalf("expected CIDR match ActionBypass, got (%q, %v)", action, matched)
+	}
+}
+
+func TestMatchTrafficRegexPreservesHostCase(t *testing.T) {
+	m := newTestManager(t)
+	m.AddRule(Rule{
+		Priority: 10,
+		Enabled:  true,
+		Action:   ActionBlock,
+		Match:    RuleMatch{HostRegex: `^API\.example\.com$`},
+	})
+	m.SetEnabled(true)
+
+	if action, _, matched := m.MatchTraffic("API.example.com", "192.168.1.5"); !matched || action != ActionBlock {
+		t.Fatalf("expected case-sensitive regex match, got (%q, %v)", action, matched)
+	}
+	if _, _, matched := m.MatchTraffic("api.example.com", "192.168.1.5"); matched {
+		t.Fatal("lowercase hostname unexpectedly matched case-sensitive regex")
 	}
 }

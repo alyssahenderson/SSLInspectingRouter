@@ -579,14 +579,14 @@ func (m *Manager) MatchTraffic(host, ip string) (action Action, blockMode BlockM
 			continue
 		}
 
-		if m.ruleMatches(rule, hostLower, ipTrimmed, parsedIP) {
+		if m.ruleMatches(rule, host, hostLower, ipTrimmed, parsedIP) {
 			return rule.Action, rule.BlockMode, true
 		}
 	}
 	return "", "", false
 }
 
-func (m *Manager) ruleMatches(rule Rule, hostLower, ip string, parsedIP net.IP) bool {
+func (m *Manager) ruleMatches(rule Rule, host, hostLower, ip string, parsedIP net.IP) bool {
 	ruleMatch := rule.Match
 	cm := rule.compiled
 	if cm == nil {
@@ -600,8 +600,8 @@ func (m *Manager) ruleMatches(rule Rule, hostLower, ip string, parsedIP net.IP) 
 		}
 	}
 
-	if ruleMatch.HostRegex != "" && hostLower != "" {
-		if cm.hostRegexOK && cm.hostRegex.MatchString(hostLower) {
+	if ruleMatch.HostRegex != "" && host != "" {
+		if cm.hostRegexOK && cm.hostRegex.MatchString(host) {
 			return true
 		}
 	}

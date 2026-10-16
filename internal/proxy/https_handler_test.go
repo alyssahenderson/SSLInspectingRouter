@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -119,6 +120,49 @@ func (c *stubTunnelConn) SetReadDeadline(_ time.Time) error {
 
 func (c *stubTunnelConn) SetWriteDeadline(_ time.Time) error {
 	return nil
+}
+
+type deadlineRecordingConn struct {
+	stubTunnelConn
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (c *deadlineRecordingConn) SetDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deadline = deadline
+	return nil
+}
+
+func (c *deadlineRecordingConn) currentDeadline() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deadline
+}
+
+func TestTunnelActivityRefreshesBothConnectionDeadlines(t *testing.T) {
+	clientConn := &deadlineRecordingConn{}
+	upstreamConn := &deadlineRecordingConn{}
+	activity := &tunnelActivity{
+		conns:   []net.Conn{clientConn, upstreamConn},
+		timeout: time.Minute,
+	}
+	upstream := &idleTimeoutConn{Conn: upstreamConn, activity: activity}
+
+	activity.refresh()
+	initialClientDeadline := clientConn.currentDeadline()
+	initialUpstreamDeadline := upstreamConn.currentDeadline()
+	if _, err := upstream.Write([]byte("progress")); err != nil {
+		t.Fatalf("upstream Write: %v", err)
+	}
+
+	if !clientConn.currentDeadline().After(initialClientDeadline) {
+		t.Fatal("activity did not refresh the client connection deadline")
+	}
+	if !upstreamConn.currentDeadline().After(initialUpstreamDeadline) {
+		t.Fatal("activity did not refresh the upstream connection deadline")
+	}
 }
 
 func TestExtractSNIReadsFragmentedClientHello(t *testing.T) {

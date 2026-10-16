@@ -441,8 +441,13 @@ func (h *HTTPSHandler) handleBypassedTLS(clientConn net.Conn, hostname, sourceIP
 	}
 	_ = upstreamConn.SetWriteDeadline(time.Time{})
 
-	clientIdle := &idleTimeoutConn{Conn: clientConn, timeout: tunnelIdleTimeout}
-	upstreamIdle := &idleTimeoutConn{Conn: upstreamConn, timeout: tunnelIdleTimeout}
+	activity := &tunnelActivity{
+		conns:   []net.Conn{clientConn, upstreamConn},
+		timeout: tunnelIdleTimeout,
+	}
+	activity.refresh()
+	clientIdle := &idleTimeoutConn{Conn: clientConn, activity: activity}
+	upstreamIdle := &idleTimeoutConn{Conn: upstreamConn, activity: activity}
 
 	errCh := make(chan error, 2)
 
@@ -1023,21 +1028,42 @@ func (rc *replayConn) Read(b []byte) (int, error) {
 
 type idleTimeoutConn struct {
 	net.Conn
+	activity *tunnelActivity
+}
+
+type tunnelActivity struct {
+	conns   []net.Conn
 	timeout time.Duration
+	mu      sync.Mutex
+}
+
+func (a *tunnelActivity) refresh() {
+	if a == nil || a.timeout <= 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	deadline := time.Now().Add(a.timeout)
+	for _, conn := range a.conns {
+		_ = conn.SetDeadline(deadline)
+	}
 }
 
 func (c *idleTimeoutConn) Read(b []byte) (int, error) {
-	if c.timeout > 0 {
-		_ = c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.activity.refresh()
 	}
-	return c.Conn.Read(b)
+	return n, err
 }
 
 func (c *idleTimeoutConn) Write(b []byte) (int, error) {
-	if c.timeout > 0 {
-		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.timeout))
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.activity.refresh()
 	}
-	return c.Conn.Write(b)
+	return n, err
 }
 
 func bufioReaderFromConn(conn net.Conn) *bufio.Reader {

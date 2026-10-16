@@ -1,9 +1,39 @@
 package proxy
 
 import (
+	"bytes"
+	"io"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/dmitryporotnikov/sslinspectingrouter/internal/logger"
 )
+
+func TestNewUpstreamTransportDisablesHTTP2(t *testing.T) {
+	if transport := newUpstreamTransport(nil); transport.ForceAttemptHTTP2 {
+		t.Fatal("ForceAttemptHTTP2 = true, want false")
+	}
+}
+
+func TestReadRequestBodyPreviewKeepsTruncationSentinelAndFullReplay(t *testing.T) {
+	limit := logger.LogBodyLimit()
+	body := strings.Repeat("x", limit+5)
+	req := httptest.NewRequest("POST", "http://example.com", strings.NewReader(body))
+
+	preview, upstreamBody := readRequestBodyPreview(req)
+	if len(preview) != limit+1 {
+		t.Fatalf("preview length = %d, want %d", len(preview), limit+1)
+	}
+	replayed, err := io.ReadAll(upstreamBody)
+	if err != nil {
+		t.Fatalf("reading replay body: %v", err)
+	}
+	if !bytes.Equal(replayed, []byte(body)) {
+		t.Fatalf("replayed body length = %d, want %d", len(replayed), len(body))
+	}
+}
 
 func TestNormalizeSOCKS5Address(t *testing.T) {
 	tests := []struct {

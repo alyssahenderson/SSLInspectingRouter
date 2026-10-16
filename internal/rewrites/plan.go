@@ -107,7 +107,7 @@ func (p *Plan) RewriteBody(h http.Header, rawBody []byte) ([]byte, bool, error) 
 			if idx < 0 {
 				continue
 			}
-			modified = append(modified[:idx:idx], bytes.ReplaceAll(modified[idx:], op.from, op.to)...)
+			modified = bytes.ReplaceAll(modified, op.from, op.to)
 			changed = true
 		case bodyOpRegex:
 			if op.re == nil || !op.re.Match(modified) {
